@@ -12,356 +12,489 @@ The data  is relayed to a MQTT server to which a logging client should be subscr
 
  The current state is stored in EEPROM and restored on bootup
 */
-
-#include <esp8266_peri.h> //register map and access
+#include <DebugSerial.h>
+#include <ESP.h>
 #include <ESP8266WiFi.h>
+#include <Wire.h>         //https://playground.arduino.cc/Main/WireLibraryDetailedReference
+#include <Time.h>         //Look at https://github.com/PaulStoffregen/Time for a more useful internal timebase library
+#include <esp8266_peri.h> //register map and access
+#include <ArduinoJson.h>
 #include <PubSubClient.h> //https://pubsubclient.knolleary.net/api.html
-#include <EEPROM.h>
-#include <Wire.h> //https://playground.arduino.cc/Main/WireLibraryDetailedReference
-#include <Time.h> //Look at https://github.com/PaulStoffregen/Time for a more useful internal timebase library
-#include <WiFiUdp.h>
-//#include <Bounce2.h>
-//#include <OneWire.h>
+#define MAX_TIME_INACTIVE 0 //to turn off the de-activation of a telnet session
+#include "RemoteDebug.h"  //https://github.com/JoaoLopesF/RemoteDebug
 
-IPAddress timeServer(193,238,191,249); // pool.ntp.org NTP server
-unsigned long NTPseconds; //since 1970
+//Create a remote debug object
+RemoteDebug Debug;
 
-//Strings
+#include <ESP8266WebServer.h> //Needed for common_funcs. Web server will be needed later. 
+#include <ESP8266HTTPUpdateServer.h>
+ESP8266WebServer server(80);
+ESP8266HTTPUpdateServer updater;
+
+//Ntp dependencies - available from v2.4
+#include <time.h>
+#include <sys/time.h>
+#include <coredecls.h>
+#define TZ              0       // (utc+) TZ in hours
+#define DST_MN          60      // use 60mn for summer time in some countries
+#define TZ_MN           ((TZ)*60)
+#define TZ_SEC          ((TZ)*3600)
+#define DST_SEC         ((DST_MN)*60)
+time_t now; //use as 'gmtime(&now);'
+
+//Hardware device system functions - reset/restart etc
+#ifdef ESP8266_blah
+extern "C" {
+#include "ets_sys.h" //Base timer and interrupt handling 
+#include "osapi.h"   //re-cast ets_sys names  - might be missing hw_timer_t - cast to uint32_t  or _ETSTIMER_ ?
+#include "user_interface.h"
+}
+#endif
+
+//Used by pulseIn
+#include <limits.h>
+#include "wiring_private.h"
+#include "pins_arduino.h"
+
+//Hardware device system functions - reset/restart etc
+EspClass device;
+long int nowTime, startTime, indexTime;
+
+//Local Strings
 const char* myHostname = "espFGM01";
-const char* ssid = "BadgerHome";
-const char* password = "";
-const char* pubsubUserID = "publicbadger";
-const char* pubsubUserPwd = "";
-const char* mqtt_server = "obbo.i-badger.co.uk";
-const char* thisID = "BadgerFGM1";
-const char* outTopic = "Skybadger/IoT/Devices/";
-const char* inTopic = "Skybadger/IoT/Devices/#";
+const char* thisID = myHostname;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
-long lastMsg = 0;
-char msg[50];
+//Required by reconnectNB in common_funcs
+volatile int timerSet = false;
+volatile boolean timeoutFlag = false;
+volatile boolean callbackFlag = false;
 
-// A UDP instance to let us send and receive packets over UDP
-WiFiUDP Udp;
-unsigned int localPort = 2390;      // local port to listen for UDP packets
-const int NTP_PACKET_SIZE = 48; // NTP time stamp is in the first 48 bytes of the message
-byte packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
+ETSTimer timeoutTimer, fineTimer, coarseTimer;
+void onTimeoutTimer( void* ptr );
+void onCoarseTimer ( void* ptr );
+void onFineTimer   ( void* ptr );
+volatile boolean coarseTimerFlag = false;
+volatile boolean fineTimerFlag = false;
+
+#include <SkybadgerStrings.h>
+#include <Skybadger_common_funcs.h>
 
 //Interrupt handler variables
-#define PulseCounterPin 0
+const byte PulseCounterPin = 14;//Pin 14 on ESP-12E is D5 
+const int MAXDATA = 1000; //max period is 25us - means 25ms to acquire. 
+volatile uint32_t dataCache[MAXDATA];
+volatile uint32_t lastClockValue = 0;
+volatile uint32_t newClockValue = 0;
 volatile bool newDataFlag = false;
-volatile long unsigned int lastClockValue = 0L;
-volatile long unsigned int newClockValue = 0L;
-volatile int signalDirection = 0; 
-
+//volatile int signalDirection = 0; 
+  
 //Acquired data storage and processing 
-const int MAXDATA = 1024;
-static long int dataCache[MAXDATA];
 static int dataCount = 0;
-static int dataPtr = 0;
-static long double runningSum;
-static long newAvg, oldAvg;
+static int dataIndex = 0;
+static unsigned long avgSum = 0UL;
+static float runningVar = 0.0F, varSum = 0.0F;
+static float runningAvg = 0.0F;
+static uint32_t datum = 0;
+static uint32_t lastDatum = 0;
 
-const byte steps[4] = { 0b01111, 0b01101, 0b01001, 0b00110 };
-enum StepDirection { FORWARDS=0, REVERSE=1 };
-int stepDirection;
-long int stepCount = 0L;
+uint32_t inline ICACHE_RAM_ATTR myGetCycleCount()
+{
+    uint32_t ccount;
+    __asm__ __volatile__("esync; rsr %0,ccount":"=a" (ccount));
+    return ccount;
+}
 
 /*
-  Interupt handler function captures clock counts at rising and falling edges on input pin.
+  Interrupt handler function captures clock counts at rising and falling edges on input pin.
   Sets flag for main loop to calculate pule width. 
   Check for potential issue of loop() taking multiple pulse count lengths. 
   Address using countHandled flag ?
   https://github.com/esp8266/esp8266-wiki/wiki/gpio-registers
+  Measured on esP8266-12 to take 300K 160Mhz clocks per loop iteration  - 20ms. 
 */
-void pulseCounter(void)
-{
- //if edge rising, reset counter
- signalDirection = GPIP(PulseCounterPin); //READ_PERI_REG( 0x60000318, PulseCounterPin );
- if ( signalDirection == 1 ) 
- {
-    newClockValue =  ESP.getCycleCount();
- }
- else //this must be a falling edge, so read clock counter to determine time since last rising edge
- {
-    lastClockValue = newClockValue;
-    newClockValue = ESP.getCycleCount();
-   
-    //set flag.
-    newDataFlag = 1;
- }
-}
-
-void setup_wifi()
-{
-  delay(10);
-   
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-
-  WiFi.hostname( myHostname );
-  WiFi.begin(ssid, password);
-  Serial.print("Searching for WiFi..");
-  while (WiFi.status() != WL_CONNECTED) 
-  {
-    delay(500);
-      Serial.print(".");
-  }
-  Serial.println("WiFi connected");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-}
-
-/* MQTT callback for subscription and topic.
- * Only respond to valid states ""
+/*
+ * This variant tries to capture all the data in the ISR for post-processing in the loop handler. 
+ * Only register for falling edge processing - handle entire period. 
  */
-void callback(char* topic, byte* payload, unsigned int length) 
+void inline ICACHE_RAM_ATTR pulseCounter(void)
 {
-  char* output;
-
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
-    
-  for (int i = 0; i < length; i++) 
-  {
-    Serial.print((char)payload[i]);
-  }
-  Serial.println();
-
-  //post output to subscribing client using the same process.
-  if ((char)payload[0] == '0') 
-  {
-    Serial.println("Received '0' ");
-    //EEPROM.write(0, relayState);    // Write state to EEPROM
-    //EEPROM.commit();
-  }
-  else if ((char)payload[0] == '1') 
-  {
-    Serial.println("Received '1'" );
-    //EEPROM.write(0, relayState);    // Write state to EEPROM
-    //EEPROM.commit();
-
-    checkTime();
+  static volatile int dataCtr = 0;
+  static volatile uint32_t localDatum = 0;
   
-    //publish to our device topic
-    output = "{ \"time\": 1234567890, \"value\": 567890 }";
-    client.publish( outTopic, output );
-  } 
-  else if ((char)payload[0] == '2') 
+  if( !newDataFlag ) //loop handler has signalled post-process is complete - get more. 
   {
-    Serial.print("Received '2' ");
-    //EEPROM.write(0, relayState);    // Write state to EEPROM
-    //EEPROM.commit();
-  }
-}
-
-void reconnect() 
-{
-  // Loop until we're reconnected
-  while (!client.connected()) 
-  {
-    Serial.print("Attempting MQTT connection...");
-    // Attempt to connect
-    if (client.connect(thisID, pubsubUserID, pubsubUserPwd )) 
+    if( dataCtr < MAXDATA ) //we haven't finished collecting it yet.
     {
-      /*
-      char* topic = (char*) malloc(sizeof(char) * (sizeof(outTopic) + sizeof("/") + sizeof(thisID) + 1) );
-      memcpy( topic, outTopic, sizeof(outTopic)-1);
-      memcpy( &topic[sizeof(outTopic)], "/", 1);
-      memcpy( &topic[sizeof(outTopic)+1], thisID, sizeof( thisID));
-      */            
-      Serial.println("connected");
-      // Once connected, publish an announcement...
-      client.publish( outTopic, "BadgerIoT1 connected");
-      // ... and resubscribe
-      client.subscribe(inTopic);
-    }
-    else
-    {
-     // Serial.print("failed, rc=");
-      Serial.print(client.state());
-      /*
-Returns the current state of the client. If a connection attempt fails, this can be used to get more information about the failure.
-int - the client state, which can take the following values (constants defined in PubSubClient.h):
--4 : MQTT_CONNECTION_TIMEOUT - the server didn't respond within the keepalive time
--3 : MQTT_CONNECTION_LOST - the network connection was broken
--2 : MQTT_CONNECT_FAILED - the network connection failed
--1 : MQTT_DISCONNECTED - the client is disconnected cleanly
-0 : MQTT_CONNECTED - the client is connected
-1 : MQTT_CONNECT_BAD_PROTOCOL - the server doesn't support the requested version of MQTT
-2 : MQTT_CONNECT_BAD_CLIENT_ID - the server rejected the client identifier
-3 : MQTT_CONNECT_UNAVAILABLE - the server was unable to accept the connection
-4 : MQTT_CONNECT_BAD_CREDENTIALS - the username/password were rejected
-5 : MQTT_CONNECT_UNAUTHORIZED - the client was not authorized to connect
-       */
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      for(int i = 0; i<5000; i++)
+      newClockValue =  myGetCycleCount();//device.getCycleCount();
+      localDatum = newClockValue - lastClockValue; 
+      lastClockValue = newClockValue;
+      
+      if ( localDatum > 1100 && localDatum < 5000 ) //sanity check on range
       {
-        delay(1);
-        //delay(20);
-        //yield();
+        dataCache[dataCtr] = localDatum;
+        dataCtr++;    
       }
     }
+    else //we are done collecting 
+    {
+      //set flag for post-processing when the buffer is full.
+      newDataFlag = true;
+      dataCtr = 0;      
+    }
+  }
+  else //flag is still high
+  {
+    //do nothing until loop handler handles the data 
+    ;
   }
 }
 
-void setup() 
+//Original - uses rises and falling flags on interrupt attach call. 
+//void inline ICACHE_RAM_ATTR pulseCounter(void)
+//{
+//  //if edge rising, reset counter
+//  signalDirection = GPIP(PulseCounterPin); //READ_PERI_REG( 0x60000318, PulseCounterPin );
+//  if ( signalDirection == 1 ) 
+//  {
+//    newClockValue =  myGetCycleCount();//device.getCycleCount();
+//  }
+//  else //this must be a falling edge, so read clock counter to determine time since last rising edge
+//  {
+//    lastClockValue = newClockValue;
+//    newClockValue = myGetCycleCount();//device.getCycleCount();
+//   
+//    //set flag.
+//    newDataFlag = 1;
+//  }
+//}
+//digitalRead(pin)
+#define WAIT_FOR_PIN_STATE(state) \
+    while ( GPIP(pin) != (state)) { \
+        if (myGetCycleCount() - start_cycle_count > timeout_cycles) { \
+            return 0; \
+        } \
+        optimistic_yield(5000); \
+    }
+    
+// max timeout is 27 seconds at 160MHz clock and 54 seconds at 80MHz clock
+uint32_t myPulseIn( uint8_t pin, uint8_t state, unsigned long timeout)
 {
-  EEPROM.begin(512);              // Begin eeprom to store on/off state
-/* For  the time when these devices are used to control a relay.. 
- *  probably via a io expander and PNP drivers for 8 relays. 
-  pinMode(relay_pin, OUTPUT);     // Initialize the relay pin as an output
-  pinMode(button_pin, INPUT);     // Initialize the relay pin as an output
-  pinMode(13, OUTPUT);
-  relayState = EEPROM.read(0);
-  digitalWrite(relay_pin,relayState);  
- */
-  // Device is an ESP8266-01 which has only 4 output pins, two are used to do serial i/f and remaining two take part in programming 
-  // so we are careful in choice of pins and direction/states
-  
-  Serial.begin( 115200, SERIAL_8N1, SERIAL_TX_ONLY);
-  Serial.println();
-  
-  //Pins mode and direction setup
-  pinMode( PulseCounterPin, INPUT);           // set pin to input
-  digitalWrite( PulseCounterPin, HIGH);       // turn on pullup resistors
-  
-  pinMode(2, INPUT );
-  digitalWrite( 2, HIGH);       // turn on pullup resistors
-
-  attachInterrupt( PulseCounterPin , pulseCounter, RISING|FALLING );
-  
-  //I2C setup SDA pin 0, SCL pin 2
-  //Wire.begin(0, 2);
-  
-  // Connect to wifi 
-  setup_wifi();                   
-
-  //Listen for UDP Packet
-  Udp.begin(localPort);
-  
-  //Open a connection to MQTT
-  client.setServer(mqtt_server, 1883);
-  client.connect(thisID, pubsubUserID, pubsubUserPwd ); 
-  
-  //Create a timer-based callback that causes this device to read the local i2C bus devices for data to publish.
-  client.setCallback(callback);
+    const uint32_t max_timeout_us = clockCyclesToMicroseconds(UINT_MAX);
+    if (timeout > max_timeout_us) 
+    {
+        timeout = max_timeout_us;
+    }
+    const uint32_t timeout_cycles = microsecondsToClockCycles(timeout);
+    const uint32_t start_cycle_count = myGetCycleCount();
+    
+    //sync with external edge
+    WAIT_FOR_PIN_STATE( !state );
+    
+    //get time when edge changes to desired state
+    WAIT_FOR_PIN_STATE(state);
+    const uint32_t pulse_start_cycle_count = myGetCycleCount();
+    
+    //Wait for next edge change to isolate just the up or down part of a rectangular wave - ie phase 
+    WAIT_FOR_PIN_STATE(!state);
+    //Or wait until next same state detected - ie entire period. 
+    WAIT_FOR_PIN_STATE(state);
+    
+    //return time measured by system clocks. 
+    return (myGetCycleCount() - pulse_start_cycle_count);
 }
 
 void loop() 
 {
-  unsigned long int datum;
-  if( newDataFlag )
-  {
-    datum = newClockValue - lastClockValue;
+  static boolean dataProcessed = false;
 
-    if ( dataCount < MAXDATA )
-    {
-      dataCache[dataCount] = datum;
-      dataCount++;
-    }
-    else //dataCount = MAXDATA, buffer is full;
-    {
-       //treat buffer as circular and overwrite oldest data point
-       dataCache[dataPtr] = datum;
-       dataPtr++;
-       dataPtr = dataPtr % MAXDATA;
-    }
-    //calc new average - take off last point*number of points and add in the new one.
-    newAvg = oldAvg - ((dataCache[ (dataPtr-1)% MAXDATA ] / dataCount ) + datum*(dataCount+1%MAXDATA));
-  }
+  debugV("Cycle: %u \n", ESP.getCycleCount() );
   
-  if (!client.connected()) 
+  if( coarseTimerFlag )
   {
-    reconnect();
+    //Use the timer to cause new data to be collected. 
+    if( dataProcessed ) 
+    {
+      dataProcessed  = false;
+      if( newDataFlag )
+        newDataFlag = false; 
+    }
+    
+    coarseTimerFlag = false;
   }
   
+  if( newDataFlag && !dataProcessed )
+  {
+    dataIndex = 0;
+    runningAvg = 0.0F;
+    runningVar = 0.0F;
+    avgSum = 0;
+    varSum = 0.0F;
+    //calc the mean
+    for ( dataIndex = 0; dataIndex < MAXDATA; dataIndex++ )
+    {  
+       avgSum += dataCache[dataIndex];
+    }
+    runningAvg =  avgSum/((float)MAXDATA);     
+    //calc the variance
+    for ( dataIndex = 0; dataIndex < MAXDATA; dataIndex++ )
+    {  
+       varSum += (float) pow( ( (float) dataCache[dataIndex] - runningAvg), 2.0);
+    }
+    runningVar = varSum/((float)MAXDATA);       
+    debugI( "New datum - mean: %f, var: %f \n", runningAvg, runningVar );
+
+// Old code for updating live values per reading.     
+//    else //buffer is full and operating as a circular buffer
+//    {
+//       //calc new average - take off oldest point in buffer and add in the new one.
+//       lastDatum = (dataIndex == 0 ) ? dataCache[MAXDATA-1]: dataCache[dataIndex -1]; 
+//       
+//       avgSum -= lastDatum;
+//       varSum -= (float) pow( ((float) lastDatum - runningAvg), 2.0 );
+//
+//       avgSum += datum;
+//       runningAvg = avgSum/((float)dataCount);
+//       
+//       varSum += (float) pow( ( (float) datum - runningAvg), 2.0);
+//       runningVar = varSum/((float)dataCount);
+//
+//       Serial.printf("New old: %lu, new:%lu, mean: %f, var: %f \n", lastDatum, datum, runningAvg, runningVar );
+//    }  
+
+    dataProcessed = true;
+  }
+
+  uint32_t length = myPulseIn( PulseCounterPin, 1, 8000/*us*/ );
+  debugD( "Length: %u \n", length );
+  
+  if ( !client.connected() )
+  {
+    debugW( "Waiting on client sync reconnection ");
+    //reconnect();
+    reconnectNB();
+    debugI( "MQTT reconnected  ");
+    client.setCallback( callback );
+    client.subscribe(inTopic);
+  }
+  else
+  {
+    //Service MQTT keep-alives
+    client.loop();
+    if (callbackFlag ) 
+    {
+        //publish results
+        publishHealth();
+        publishData();
+        callbackFlag = false;
+    }
+  }
+
+  //If there are any web client connections - handle them.
+  server.handleClient();
+
+  // Remote debug over WiFi
+  Debug.handle();
+  // Or
+  //debugHandle(); // Equal to SerialDebug  
+
+  //Show welcome message
+ 
+  Debug.setSerialEnabled(false);
+}
+
+void onFineTimer( void* pArg )
+{
+  //Read command list and apply. 
+  fineTimerFlag = true;
+}
+
+void onCoarseTimer( void* pArg )
+{
+  //Read command list and apply. 
+  coarseTimerFlag = true;
+}
+
+//Used to complete timeout actions. 
+void onTimeoutTimer( void* pArg )
+{
+   ;;//fn moved to Shutter controller  - delete later if not used. 
+   timeoutFlag = true;
+}
+
+void setup() 
+{
+  Serial.begin( 115200 );
+  //Serial.begin( 115200, SERIAL_8N1, SERIAL_TX_ONLY);
+  Serial.println("connecting wifi");
+
+  //Start NTP client
+  configTime(TZ_SEC, DST_SEC, timeServer1, timeServer2, timeServer3 );
+  Serial.println( "Time Services setup");
+
+  // Connect to wifi 
+  setupWifi();                   
+
+  //Debugging over telnet setup
+  // Initialize the server (telnet or web socket) of RemoteDebug
+  //Debug.begin(HOST_NAME, startingDebugLevel );
+  Debug.begin( WiFi.hostname().c_str(), Debug.ERROR ); 
+  Debug.setSerialEnabled(true);//until set false 
+  // Options
+  // Debug.setResetCmdEnabled(true); // Enable the reset command
+  // Debug.showProfiler(true); // To show profiler - time between messages of Debug
+  //In practice still need to use serial commands until debugger is up and running.. 
+  debugE("Remote debugger enabled and operating");
+
+  // Device is an ESP8266-01 which has only 4 output pins, two are used to do serial i/f and remaining two take part in programming 
+  // so we are careful in choice of pins and direction/states
+  
+  //Pins mode and direction setup
+  pinMode( PulseCounterPin, INPUT);           // set pin to input
+  //digitalWrite( PulseCounterPin, HIGH);       // turn on pullup resistors
+  
+  //Open a connection to MQTT
+  DEBUGS1("Configuring MQTT connection to :");DEBUGSL1( mqtt_server );
+  client.setServer( mqtt_server, 1883 );
+  Serial.printf(" MQTT settings id: %s user: %s pwd: %s\n", thisID, pubsubUserID, pubsubUserPwd );
+  client.connect( thisID, pubsubUserID, pubsubUserPwd ); 
+  //Create a timer-based callback that causes this device to read the local i2C bus devices for data to publish.
+  client.setCallback( callback );
+  client.subscribe( inTopic );
+  publishHealth();
   client.loop();
-}
+  DEBUGSL1("Configured MQTT connection");
+ 
+  //Using an input on change detector interrupt
+  //try just one edge - will count the envelope frequency
+  //then try both edges and set for falling followed by rising. 
+  //Use same handler for both. 
+  //attachInterrupt( digitalPinToInterrupt(PulseCounterPin), pulseCounter, RISING );  
+  attachInterrupt( digitalPinToInterrupt(PulseCounterPin), pulseCounter, FALLING );  
 
-void checkTime()
-{
-  // send an NTP packet to a time server
-  sendNTPpacket(timeServer); 
+  //Start web server
+  updater.setup( &server );
+  server.begin();
+  Serial.println( "webserver setup complete");
+
+  //setup interrupt-based 'soft' alarm handler for dome state update and async commands
+  ets_timer_setfn( &fineTimer,    onFineTimer,    NULL ); 
+  ets_timer_setfn( &coarseTimer,  onCoarseTimer,  NULL ); 
+  ets_timer_setfn( &timeoutTimer, onTimeoutTimer, NULL ); //MQTT non-blocking handler
+
+  //ets_timer_arm_new( &fineTimer,   1000,      1/*repeat*/, 1);//millis
+  ets_timer_arm_new( &coarseTimer, 5000,     1/*repeat*/, 1);//millis
+  //ets_timer_arm_new( &timeoutTimer, 2500, 0/*one-shot*/, 1);//set by MQTT NB handler
   
-  // wait to see if a reply is available
-  if (Udp.parsePacket()) 
-  {
-    Serial.println("packet received");
-    // We've received a packet, read the data from it
-    Udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
+  debugV("Setup: %u\n", ESP.getCycleCount() );
 
-    //the timestamp starts at byte 40 of the received packet and is four bytes,
-    // or two words, long. First, esxtract the two words:
-
-    unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
-    unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
-    // combine the four bytes (two words) into a long integer
-    // this is NTP time (seconds since Jan 1 1900):
-    unsigned long secsSince1900 = highWord << 16 | lowWord;
-    Serial.print("Seconds since Jan 1 1900 = ");
-    Serial.println(secsSince1900);
-
-    // now convert NTP time into everyday time:
-    Serial.print("Unix time = ");
-    // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
-    const unsigned long seventyYears = 2208988800UL;
-    // subtract seventy years:
-    unsigned long epoch = secsSince1900 - seventyYears;
-    // print Unix time:
-    Serial.println(epoch);
-
-    // print the hour, minute and second:
-    Serial.print("The UTC time is ");       // UTC is the time at Greenwich Meridian (GMT)
-    Serial.print((epoch  % 86400L) / 3600); // print the hour (86400 equals secs per day)
-    Serial.print(':');
-    if (((epoch % 3600) / 60) < 10) 
-    {
-      // In the first 10 minutes of each hour, we'll want a leading '0'
-      Serial.print('0');
-    }
-    Serial.print((epoch  % 3600) / 60); // print the minute (3600 equals secs per minute)
-    Serial.print(':');
-    if ((epoch % 60) < 10) 
-    {
-      // In the first 10 seconds of each minute, we'll want a leading '0'
-      Serial.print('0');
-    }
-    Serial.println(epoch % 60); // print the second
-  }
+  //It would be really nice to find a way to feed a HW counter/timer directly 
+  //Or we can use a variation on the pulseIn function (core_esp8266_wiring_pulse.cpp)
+  //unsigned long pulseIn(uint8_t pin, uint8_t state, unsigned long timeout)
 }
 
-// send an NTP request to the time server at the given address
-unsigned long sendNTPpacket(IPAddress& address) 
+void setupWifi(void)
 {
-  //Serial.println("1");
-  // set all bytes in the buffer to 0
-  memset(packetBuffer, 0, NTP_PACKET_SIZE);
-  // Initialize values needed to form NTP request
-  // (see URL above for details on the packets)
-  //Serial.println("2");
-  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-  packetBuffer[1] = 0;     // Stratum, or type of clock
-  packetBuffer[2] = 6;     // Polling Interval
-  packetBuffer[3] = 0xEC;  // Peer Clock Precision
-  // 8 bytes of zero for Root Delay & Root Dispersion
-  packetBuffer[12]  = 49;
-  packetBuffer[13]  = 0x4E;
-  packetBuffer[14]  = 49;
-  packetBuffer[15]  = 52;
+  //Setup Wifi
+  int zz = 00;
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname( myHostname );
 
-  Serial.println("3");
+  scanNet( );
+ 
+  WiFi.begin( ssid4, password4 );  Serial.println("Connecting");
+  while (WiFi.status() != WL_CONNECTED) 
+  {
+    delay(500);//This delay is essentially for the DHCP response. Shouldn't be required for static config.
+    Serial.print(".");
+    if ( zz++ > 200 )
+    {
+      Serial.println("Restarting to try to find a connection");
+      device.restart();
+    }
+  }
+  Serial.println("WiFi connected");
+  Serial.printf("SSID: %s, Signal strength %i dBm \n\r", WiFi.SSID().c_str(), WiFi.RSSI() );
+  Serial.printf("Hostname: %s\n\r",       WiFi.hostname().c_str() );
+  Serial.printf("IP address: %s\n\r",     WiFi.localIP().toString().c_str() );
+  Serial.printf("DNS address 0: %s\n\r",  WiFi.dnsIP(0).toString().c_str() );
+  Serial.printf("DNS address 1: %s\n\r",  WiFi.dnsIP(1).toString().c_str() );
 
-  // all NTP fields have been given values, now
-  // you can send a packet requesting a timestamp:
-  Udp.beginPacket(address, 123); //NTP requests are to port 123
-  Serial.println("4");
-  Udp.write(packetBuffer, NTP_PACKET_SIZE);
-  Serial.println("5");
-  Udp.endPacket();
-  Serial.println("6");
+  //Setup sleep parameters
+  // LIGHT_S
+  //wifi_set_sleep_type(LIGHT_SLEEP_T);
+  wifi_set_sleep_type(NONE_SLEEP_T);
+  delay(5000);
+
+  Serial.println("WiFi setup complete & connected");
 }
+
+void publishHealth( void )
+ {
+  String outTopic;
+  String output;
+  String timestamp;
+  
+  //publish to our device topic(s)
+  DynamicJsonBuffer jsonBuffer(256);  
+  JsonObject& root = jsonBuffer.createObject();
+
+  getTimeAsString2( timestamp );
+  root["time"] = timestamp;
+
+  // Once connected, publish an announcement...
+  root["hostname"] = myHostname;
+  root["message"] = "FGM Magnetometer operating";
+  root.printTo( output );
+  
+  outTopic = outHealthTopic;
+  outTopic.concat( myHostname );
+  
+  if( client.publish( outTopic.c_str(), output.c_str(), true ) )  
+  {
+    debugI( "Topic published: %s ", output.c_str() ); 
+  }
+  else
+  {
+    debugW( "Topic failed to publish: %s ", output.c_str() );   
+  }
+ }
+
+/* MQTT callback for subscription and topic.
+ * Only respond to valid states ""
+ */
+void publishData(void)
+{
+  String output;
+  String outTopic;
+  String timestamp = "";
+  
+  DynamicJsonBuffer jsonBuffer(256);  
+  getTimeAsString( timestamp );
+
+  //publish to our device topic(s)
+  JsonObject& root = jsonBuffer.createObject();
+  root["time"] = timestamp;
+  root["Bz"] = runningAvg;
+  root["Bz_err"] = sqrt(runningVar);
+  root["Hostname"] = myHostname;
+  root["sensor"] = "FGM-3h";
+  root.printTo( output );
+  
+  outTopic = outSenseTopic ;
+  outTopic.concat("magnetometer/");
+  outTopic.concat(myHostname);
+  client.publish( outTopic.c_str(), output.c_str() );
+}
+
+/* MQTT callback for subscription and topic.
+ * Only respond to valid states ""
+ * Publish under ~/skybadger/sensors/<sensor type>/<host>
+ * Note that messages have an maximum length limit of 18 bytes - set in the MQTT header file. 
+ */
+void callback(char* topic, byte* payload, unsigned int length) 
+{  
+  //set callback flag
+  callbackFlag = true;  
+ }
